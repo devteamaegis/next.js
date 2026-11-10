@@ -2352,7 +2352,7 @@ impl Project {
         };
 
         Ok(Entrypoints {
-            routes,
+            routes: routes.into(),
             middleware,
             instrumentation,
             pages_document_endpoint,
