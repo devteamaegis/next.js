@@ -3637,7 +3637,7 @@ mod tests {
     use smallvec::{SmallVec, smallvec};
     use turbo_tasks::{CellId, TaskId, TraitTypeId, ValueTypeId};
 
-    use super::{AggregatedDataUpdate, sum_collectibles_update};
+    use super::{AggregatedDataUpdate, CollectiblesUpdateVec, sum_collectibles_update};
     use crate::data::{CellRef, CollectibleRef};
 
     /// Models the collectibles part of `AggregatedDataUpdate::apply`: applies `update` to the
@@ -3906,10 +3906,10 @@ mod tests {
         let b = collectible(2);
         let update = merged([
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, 1)])
+                .collectibles_update(smallvec![(a, 1)])
                 .dirty_container_update(task_id, 1, 1),
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, -1), (b, 1)])
+                .collectibles_update(smallvec![(a, -1), (b, 1)])
                 .dirty_container_update(task_id, -1, -1),
         ]);
         assert_eq!(dirty_counts(&update), None);
@@ -3917,10 +3917,10 @@ mod tests {
 
         let update = merged([
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, 1), (b, -1)])
+                .collectibles_update(smallvec![(a, 1), (b, -1)])
                 .dirty_container_update(task_id, 1, 0),
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(b, 1), (a, -1)])
+                .collectibles_update(smallvec![(b, 1), (a, -1)])
                 .dirty_container_update(task_id, -1, 0),
         ]);
         assert!(update.is_empty());
@@ -3932,9 +3932,9 @@ mod tests {
         let b = collectible(2);
         let c = collectible(3);
         let update = merged([
-            AggregatedDataUpdate::new().collectibles_update(vec![(a, 1), (b, 1)]),
-            AggregatedDataUpdate::new().collectibles_update(vec![(a, 1), (c, -1)]),
-            AggregatedDataUpdate::new().collectibles_update(vec![(b, -1)]),
+            AggregatedDataUpdate::new().collectibles_update(smallvec![(a, 1), (b, 1)]),
+            AggregatedDataUpdate::new().collectibles_update(smallvec![(a, 1), (c, -1)]),
+            AggregatedDataUpdate::new().collectibles_update(smallvec![(b, -1)]),
         ]);
         assert_eq!(dirty_counts(&update), None);
         assert_eq!(
@@ -3951,10 +3951,11 @@ mod tests {
         let a = collectible(1);
         let b = collectible(2);
         let c = collectible(3);
-        let mut larger = Vec::with_capacity(8);
+        // Capacity above the inline size, so the list is on the heap and its pointer is stable.
+        let mut larger = CollectiblesUpdateVec::with_capacity(8);
         larger.extend([(b, 1), (c, 1), (a, -1)]);
         let larger_ptr = larger.as_ptr();
-        let mut update = AggregatedDataUpdate::new().collectibles_update(vec![(a, 1)]);
+        let mut update = AggregatedDataUpdate::new().collectibles_update(smallvec![(a, 1)]);
         update.merge(AggregatedDataUpdate::new().collectibles_update(larger));
         assert_eq!(update.collectibles_update.len(), 4);
         // The smaller list was appended to the larger one, reusing its allocation.
@@ -3975,10 +3976,10 @@ mod tests {
         let a = collectible(1);
         let update = AggregatedDataUpdate::merge_all(vec![
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, 1), (a, -1)])
+                .collectibles_update(smallvec![(a, 1), (a, -1)])
                 .dirty_container_update(task_id, 1, 0),
         ]);
-        assert_eq!(update.collectibles_update, vec![(a, 1), (a, -1)]);
+        assert_eq!(update.collectibles_update.as_slice(), [(a, 1), (a, -1)]);
         assert_eq!(dirty_counts(&update), Some((task_id, 1, 0)));
     }
 
@@ -3991,16 +3992,16 @@ mod tests {
         let d = collectible(4);
         // The update with the most collectibles is not the first one. It has enough spare
         // capacity for all entries, so its allocation is used for the result.
-        let mut largest = Vec::with_capacity(16);
+        let mut largest = CollectiblesUpdateVec::with_capacity(16);
         largest.extend([(b, 1), (c, 1), (d, -1), (a, 1)]);
         let largest_ptr = largest.as_ptr();
         let updates = vec![
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, 1)])
+                .collectibles_update(smallvec![(a, 1)])
                 .dirty_container_update(task_id, 1, 0),
             AggregatedDataUpdate::new().collectibles_update(largest),
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(b, -1), (d, 1)])
+                .collectibles_update(smallvec![(b, -1), (d, 1)])
                 .dirty_container_update(task_id, 0, 1),
         ];
         let update = AggregatedDataUpdate::merge_all(updates);
@@ -4014,10 +4015,10 @@ mod tests {
 
         let update = AggregatedDataUpdate::merge_all(vec![
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, 1)])
+                .collectibles_update(smallvec![(a, 1)])
                 .dirty_container_update(task_id, 1, 1),
             AggregatedDataUpdate::new()
-                .collectibles_update(vec![(a, -1)])
+                .collectibles_update(smallvec![(a, -1)])
                 .dirty_container_update(task_id, -1, -1),
         ]);
         assert!(update.is_empty());
