@@ -5,7 +5,6 @@ import type { TraceEvent } from '../../packages/next/src/trace/types'
 // Real dev/build behavior is covered by test/e2e/app-dir/otel-tooling.
 // Keep only safety conditions that cannot be reliably induced in that fixture.
 describe('tooling OTel safety', () => {
-  const previousGate = process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING
   let api: typeof import('@opentelemetry/api')
   let sdk: typeof import('@opentelemetry/sdk-trace')
   let backend: typeof import('../../packages/next/src/trace/otel')
@@ -19,14 +18,18 @@ describe('tooling OTel safety', () => {
 
   beforeEach(() => {
     jest.resetModules()
-    process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING = '1'
     api = require('next/dist/compiled/@opentelemetry/api')
     api.trace.disable()
+    api.metrics.disable()
     local = []
     exported = []
     jest.doMock('../../packages/next/src/trace/report', () => ({
       reporter: { report: (event: TraceEvent) => local.push(event) },
     }))
+    require('../../packages/next/src/trace/trace').initializeTraceState({
+      lastId: 0,
+      devAndBuildOtel: true,
+    })
     sdk = require('@opentelemetry/sdk-trace')
     backend = require('../../packages/next/src/trace/otel')
     reporting = require('../../packages/next/src/trace/otel-reporting')
@@ -36,12 +39,10 @@ describe('tooling OTel safety', () => {
   })
 
   afterEach(async () => {
-    await backend.flushReporting()
-    if (previousGate === undefined)
-      delete process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING
-    else process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING = previousGate
+    backend.closeReporting()
     jest.dontMock('../../packages/next/src/trace/report')
     api.trace.disable()
+    api.metrics.disable()
     api.context.disable()
     jest.restoreAllMocks()
     jest.useRealTimers()
@@ -86,7 +87,7 @@ describe('tooling OTel safety', () => {
       expect(local).toHaveLength(count + 1)
       installProvider()
       backend.enableReporting()
-      await backend.flushReporting()
+      backend.closeReporting()
       expect(exported).toHaveLength(
         limit === 'count' ? reporting.REPLAY_EVENT_LIMIT : 1
       )
@@ -104,7 +105,7 @@ describe('tooling OTel safety', () => {
     backend.enableReporting()
     expect(() => child('child', root).end()).not.toThrow()
     expect(() => root.end()).not.toThrow()
-    await backend.flushReporting()
+    backend.closeReporting()
     expect(local.map((span) => span.name)).toEqual(['child', 'next-build'])
     expect(exported).toHaveLength(0)
     expect(warn).toHaveBeenCalledTimes(1)
@@ -185,14 +186,100 @@ describe('tooling OTel safety', () => {
     )
   })
 
-  it('bounds a hanging flush hook and clears its timeout', async () => {
-    jest.useFakeTimers()
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
-    backend.enableReporting(() => new Promise(() => {}))
-    const flush = backend.flushReporting()
-    await jest.advanceTimersByTimeAsync(reporting.FLUSH_TIMEOUT_MS)
-    await expect(flush).resolves.toBeUndefined()
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(jest.getTimerCount()).toBe(0)
+  it('leaves recorded metrics available for the application to export after close', async () => {
+    const {
+      MeterProvider,
+      InMemoryMetricExporter,
+      PeriodicExportingMetricReader,
+      AggregationTemporality,
+    } = require('@opentelemetry/sdk-metrics')
+    const exporter = new InMemoryMetricExporter(
+      AggregationTemporality.CUMULATIVE
+    )
+    const provider = new MeterProvider({
+      readers: [
+        new PeriodicExportingMetricReader({
+          exporter,
+          exportIntervalMillis: 60000,
+        }),
+      ],
+    })
+    expect(api.metrics.setGlobalMeterProvider(provider)).toBe(true)
+    try {
+      tracer.startSpan(types.ToolingSpan.nextBuild, {})
+      backend.enableReporting()
+      const {
+        createLocalSpan,
+      } = require('../../packages/next/src/server/lib/trace/local-span-recorder')
+      createLocalSpan({
+        name: 'server-restart-close-to-memory-threshold',
+        attributes: { 'memory.heapUsed': 100, 'memory.heapSizeLimit': 200 },
+      }).end()
+      backend.closeReporting()
+      await provider.forceFlush()
+      const expectedMetrics = [
+        expect.objectContaining({
+          descriptor: expect.objectContaining({
+            name: 'next.tooling.server.restarts',
+          }),
+          dataPoints: [
+            expect.objectContaining({
+              attributes: { reason: 'memory-threshold' },
+              value: 1,
+            }),
+          ],
+        }),
+      ]
+      for (const [name, value] of [
+        ['heap_used', 100],
+        ['heap_limit', 200],
+      ] as const) {
+        expectedMetrics.push(
+          expect.objectContaining({
+            descriptor: expect.objectContaining({
+              name: `next.tooling.memory.${name}`,
+            }),
+            dataPoints: [
+              expect.objectContaining({
+                attributes: {
+                  operation: 'server-restart-close-to-memory-threshold',
+                },
+                value: expect.objectContaining({ count: 1, sum: value }),
+              }),
+            ],
+          })
+        )
+      }
+      expect(exporter.getMetrics()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            scopeMetrics: expect.arrayContaining([
+              expect.objectContaining({
+                metrics: expect.arrayContaining(expectedMetrics),
+              }),
+            ]),
+          }),
+        ])
+      )
+    } finally {
+      await provider.shutdown()
+    }
+  })
+
+  it('closes reporting without ending unfinished operations or accepting new ones', () => {
+    installProvider()
+    const root = tracer.startSpan(types.ToolingSpan.nextBuild, {})
+    backend.enableReporting()
+    child('completed', root).end()
+    backend.closeReporting()
+    backend.closeReporting()
+    child('after-close', root).end()
+    root.end()
+    expect(exported.map((span) => span.name)).toEqual(['completed'])
+    expect(local.map((event) => event.name)).toEqual([
+      'completed',
+      'after-close',
+      'next-build',
+    ])
   })
 })

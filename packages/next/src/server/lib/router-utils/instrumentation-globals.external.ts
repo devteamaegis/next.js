@@ -9,6 +9,7 @@ import { interopDefault } from '../../../lib/interop-default'
 import { afterRegistration as extendInstrumentationAfterRegistration } from './instrumentation-node-extensions'
 import { getTracer, SpanStatusCode } from '../trace/tracer'
 import { InstrumentationSpan } from '../trace/constants'
+import { isToolingReportingEnabled } from '../../../trace/trace'
 
 let cachedInstrumentationModule: InstrumentationModule
 let instrumentationModuleLoadTiming: InstrumentationSpanTiming | undefined
@@ -198,12 +199,12 @@ async function registerInstrumentation(
     }
   }
   if (
-    process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1' &&
+    isToolingReportingEnabled() &&
     (process.env.__NEXT_DEV_SERVER || forToolingBuild)
   ) {
     const { enableReporting } =
       require('../../../trace/otel') as typeof import('../../../trace/otel')
-    enableReporting(instrumentation?.flushTraces?.bind(instrumentation))
+    enableReporting()
   }
 }
 
@@ -214,7 +215,7 @@ export function registerToolingBuildInstrumentation(
   distDir: string,
   hasInstrumentationHook: boolean
 ) {
-  if (process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING !== '1') return
+  if (!isToolingReportingEnabled()) return
   toolingBuildRegistration ??= (async () => {
     const previousRuntime = process.env.NEXT_RUNTIME
     process.env.NEXT_RUNTIME = 'nodejs'

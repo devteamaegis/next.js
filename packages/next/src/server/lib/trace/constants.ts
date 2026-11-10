@@ -154,6 +154,7 @@ enum ToolingSpan {
   staticCheck = 'static-check',
   staticGeneration = 'static-generation',
   collectBuildTraces = 'collect-build-traces',
+  devServerSession = 'dev-server-session',
   startDevServer = 'start-dev-server',
   setupDevBundler = 'setup-dev-bundler',
   hotReloader = 'hot-reloader',

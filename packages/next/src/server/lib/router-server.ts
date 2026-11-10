@@ -45,6 +45,9 @@ import { DevBundlerService } from './dev-bundler-service'
 import type { Span } from '@opentelemetry/api'
 import { getTracer } from './trace/tracer'
 import { ToolingSpan } from './trace/constants'
+import { getToolingSpanSource } from './trace/local-span-recorder'
+import { exportTraceState, initializeTraceState } from '../../trace'
+import { startToolingSpanReporting } from '../../trace/trace'
 import { ensureLeadingSlash } from '../../shared/lib/page-path/ensure-leading-slash'
 import { getNextPathnameInfo } from '../../shared/lib/router/utils/get-next-pathname-info'
 import { getHostname } from '../../shared/lib/get-hostname'
@@ -169,6 +172,7 @@ export async function initialize(opts: {
   experimentalHttpsServer?: boolean
   serverFastRefresh?: boolean
   startServerSpan?: Span
+  devServerSessionSpan?: Span
   quiet?: boolean
 }): Promise<ServerInitResult> {
   if (!process.env.NODE_ENV) {
@@ -192,6 +196,28 @@ export async function initialize(opts: {
       },
     }
   )
+  if (opts.dev) {
+    initializeTraceState({
+      ...exportTraceState(),
+      devAndBuildOtel: config.experimental.devAndBuildOtel,
+    })
+    if (config.experimental.devAndBuildOtel) {
+      if (opts.devServerSessionSpan) {
+        startToolingSpanReporting(
+          getToolingSpanSource(opts.devServerSessionSpan)!,
+          ToolingSpan.devServerSession,
+          true
+        )
+      }
+      if (opts.startServerSpan) {
+        startToolingSpanReporting(
+          getToolingSpanSource(opts.startServerSpan)!,
+          ToolingSpan.startDevServer,
+          !opts.devServerSessionSpan
+        )
+      }
+    }
+  }
   if (bundlerBeforeConfig !== undefined) {
     finalizeBundlerFromConfig(bundlerBeforeConfig)
   }

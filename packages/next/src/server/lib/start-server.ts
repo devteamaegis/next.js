@@ -52,6 +52,7 @@ import { isCI } from '../ci-info'
 import type { Span } from '@opentelemetry/api'
 import { getTracer } from './trace/tracer'
 import { ToolingSpan } from './trace/constants'
+import { isToolingReportingEnabled } from '../../trace/trace'
 import {
   createLocalSpan,
   getToolingSpanSource,
@@ -59,6 +60,21 @@ import {
 
 const debug = setupDebug('next:start-server')
 let startServerSpan: Span | undefined
+let devServerSessionSpan: Span | undefined
+const processStart =
+  process.hrtime.bigint() - BigInt(Math.floor(process.uptime() * 1e9))
+const processWallStart = Math.floor(Date.now() - process.uptime() * 1000)
+
+function finalizeDevSession(reason: string) {
+  devServerSessionSpan?.setAttribute('exit.reason', reason)
+  devServerSessionSpan?.end()
+  flushAllTraces()
+  if (isToolingReportingEnabled()) {
+    const { closeReporting } =
+      require('../../trace/otel') as typeof import('../../trace/otel')
+    closeReporting()
+  }
+}
 
 /**
  * Get the process ID (PID) of the process using the specified port
@@ -186,6 +202,7 @@ export async function getRequestHandlers({
     experimentalHttpsServer,
     serverFastRefresh,
     startServerSpan,
+    devServerSessionSpan,
     quiet,
   })
 }
@@ -212,6 +229,7 @@ export async function startServer(
   process.title = `next-server (v${process.env.__NEXT_VERSION})`
   let handlersReady = () => {}
   let handlersError = () => {}
+  let memoryRestartStarted = false
 
   let handlersPromise: Promise<void> | undefined = new Promise<void>(
     (resolve, reject) => {
@@ -269,7 +287,8 @@ export async function startServer(
         devMemoryThresholdRestart,
         v8.getHeapStatistics
       )
-      if (memoryRestartStats) {
+      if (memoryRestartStats && !memoryRestartStarted) {
+        memoryRestartStarted = true
         Log.warn(
           `Server is approaching the used memory threshold, restarting...`
         )
@@ -280,7 +299,7 @@ export async function startServer(
             'memory.heapUsed': String(memoryRestartStats.used_heap_size),
           },
         }).end()
-        flushAllTraces()
+        finalizeDevSession('memory-threshold')
         process.exit(RESTART_EXIT_CODE)
       }
     }
@@ -444,12 +463,8 @@ export async function startServer(
             ])
 
             // Flush any remaining traces to the trace file on shutdown
-            flushAllTraces()
-            if (isDev && process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1') {
-              const { flushReporting } =
-                require('../../trace/otel') as typeof import('../../trace/otel')
-              await flushReporting()
-            }
+            if (isDev) finalizeDevSession(signal)
+            else flushAllTraces()
 
             // Flush telemetry if this is a dev server
             if (isDev) {
@@ -637,9 +652,10 @@ export async function startServer(
           filename
         )}. Restarting the server to apply the changes...`
       )
+      finalizeDevSession('config-change')
       process.exit(RESTART_EXIT_CODE)
     })
-    wp.on('remove', (removedPath: string) => {
+    wp.on('remove', async (removedPath: string) => {
       if (dirWatchPaths.includes(removedPath)) {
         Log.error(
           `The directory at "${removedPath}" was deleted.\n\n` +
@@ -648,6 +664,7 @@ export async function startServer(
             'Deleting this directory while Next.js is running can lead to ' +
             'undefined behavior. Restarting the server to recover...'
         )
+        finalizeDevSession('output-directory-removed')
         process.exit(RESTART_EXIT_CODE)
       }
     })
@@ -697,9 +714,25 @@ if (process.env.NEXT_PRIVATE_WORKER && process.send) {
         )
       }
 
+      initializeTraceState({
+        lastId: Number(process.env.NEXT_PRIVATE_TRACE_LAST_ID ?? 0),
+      })
+      devServerSessionSpan = getTracer().startSpan(
+        ToolingSpan.devServerSession,
+        {
+          parent: null,
+          monotonicStartTime: processStart,
+          wallStartTimeMs: processWallStart,
+          attributes: {
+            ...enabledFeaturesFromParent,
+            ...rageRestartAttrsFromParent,
+          },
+        }
+      )
       const result = await getTracer().trace(
         ToolingSpan.startDevServer,
         {
+          parent: devServerSessionSpan,
           attributes: {
             cpus: String(os.availableParallelism()),
             platform: os.platform(),
@@ -712,24 +745,35 @@ if (process.env.NEXT_PRIVATE_WORKER && process.send) {
             ...rageRestartAttrsFromParent,
           },
         },
-        (span) => {
+        async (span) => {
           startServerSpan = span!
           initializeTraceState({
             ...exportTraceState(),
             defaultParentSpanId: getToolingSpanSource(startServerSpan)!.id,
           })
-          return startServer(msg.nextWorkerOptions)
+          const started = await startServer(msg.nextWorkerOptions)
+          const memoryUsage = process.memoryUsage()
+          span!.setAttributes({
+            'memory.rss': String(memoryUsage.rss),
+            'memory.heapTotal': String(memoryUsage.heapTotal),
+            'memory.heapUsed': String(memoryUsage.heapUsed),
+          })
+          if (isToolingReportingEnabled()) {
+            const { getToolingSessionAttributes } =
+              require('../../trace/session') as typeof import('../../trace/session')
+            const { traceGlobals } =
+              require('../../trace/shared') as typeof import('../../trace/shared')
+            const attributes = getToolingSessionAttributes(
+              msg.nextWorkerOptions.dir,
+              'dev',
+              !!process.env.TURBOPACK,
+              traceGlobals.get('telemetry')
+            )
+            span!.setAttributes(attributes)
+            devServerSessionSpan!.setAttributes(attributes)
+          }
+          return started
         }
-      )
-      const memoryUsage = process.memoryUsage()
-      startServerSpan!.setAttribute('memory.rss', String(memoryUsage.rss))
-      startServerSpan!.setAttribute(
-        'memory.heapTotal',
-        String(memoryUsage.heapTotal)
-      )
-      startServerSpan!.setAttribute(
-        'memory.heapUsed',
-        String(memoryUsage.heapUsed)
       )
       process.send({
         nextServerReady: true,

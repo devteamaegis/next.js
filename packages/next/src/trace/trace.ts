@@ -12,13 +12,9 @@ import type {
 } from '@opentelemetry/api'
 
 let otel: typeof import('./otel') | undefined
-if (
-  process.env.NEXT_RUNTIME !== 'edge' &&
-  process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1'
-) {
-  otel = require('./otel') as typeof import('./otel')
-} else {
-  otel = undefined
+
+export function isToolingReportingEnabled(): boolean {
+  return otel !== undefined
 }
 
 const NUM_OF_MICROSEC_IN_NANOSEC = BigInt('1000')
@@ -144,7 +140,7 @@ export function captureToolingSpanSource(
   }
 }
 
-/** Called only by finite coarse Next tracer operations, never by local helpers. */
+/** Records the selected worker hierarchy independently of SDK availability. */
 export function selectToolingSpanSource(source: ToolingSpanSource): void {
   if (shouldSaveTraceEvents) {
     savedToolingSpanSelections.push({
@@ -153,6 +149,31 @@ export function selectToolingSpanSource(source: ToolingSpanSource): void {
     })
   }
   source.reportingParentId = source.id
+}
+
+export function startToolingSpanReporting(
+  source: ToolingSpanSource,
+  name: string,
+  reportingRoot = false
+): void {
+  if (!otel) return
+  selectToolingSpanSource(source)
+  source.reporting = otel.startSpan({
+    name,
+    id: source.id,
+    parentId: source.parentId,
+    startTime: source.startTime,
+    reportingParent: source.reportingParent,
+    reportingRoot,
+  })
+}
+
+export function selectAdditionalToolingSignal(
+  source: ToolingSpanSource,
+  name: string
+): void {
+  if (!otel?.isAdditionalSignal(name)) return
+  startToolingSpanReporting(source, name)
 }
 
 /** Existing end() accepts this lossless monotonic representation. */
@@ -215,9 +236,7 @@ export function completeToolingSpan(
   } finally {
     if (source.reporting) {
       otel?.stopSpan(source.reporting, end, attributes)
-    } else if (name === 'client-hmr-latency') {
-      // One selected completed browser observation, not promotion of all fine
-      // local spans. Local delivery above keeps its original fields and timing.
+    } else if (otel?.isAdditionalSignal(name)) {
       otel?.replayCompletedSpan(
         event,
         source.startTime,
@@ -245,6 +264,7 @@ export const exportTraceState = (): TraceState => ({
   defaultParentSpanId,
   lastId: count,
   shouldSaveTraceEvents,
+  devAndBuildOtel: isToolingReportingEnabled(),
   ...(shouldSaveTraceEvents
     ? { toolingSpanSelections: savedToolingSpanSelections.slice() }
     : {}),
@@ -259,6 +279,11 @@ export const initializeTraceState = (state: TraceState) => {
   defaultParentSpanId = state.defaultParentSpanId
   shouldSaveTraceEvents = state.shouldSaveTraceEvents
   savedToolingSpanSelections = []
+  if (process.env.NEXT_RUNTIME !== 'edge' && state.devAndBuildOtel) {
+    otel = require('./otel') as typeof import('./otel')
+  } else {
+    otel = undefined
+  }
   if (otel) {
     otel.configureState(
       defaultParentSpanId,
@@ -286,9 +311,7 @@ export function recordTraceEvents(
   if (shouldSaveTraceEvents) {
     savedTraceEvents.push(...events)
   }
-  // Imported observations are local-only unless the coarse Next tracer
-  // explicitly supplies reporting selection/parent metadata.
-  if (selections?.length) otel?.replayWorkerEvents(events, selections)
+  otel?.replayWorkerEvents(events, selections)
 }
 
 export const clearTraceEvents = () => {

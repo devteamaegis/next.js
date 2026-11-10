@@ -511,6 +511,11 @@ export interface DeprecatedConfig {
 }
 
 export interface ExperimentalConfig {
+  /**
+   * Report dev and build telemetry through the application's OpenTelemetry provider.
+   * Also calls instrumentation.register() during builds, after compilation.
+   */
+  devAndBuildOtel?: boolean
   /** Native Go App Router handlers. Turbopack and self-hosted next start only. */
   goRoutes?: boolean
   /** Nudge coding agents about security upgrades, stable releases, or Future Defaults. */
@@ -2506,6 +2511,7 @@ export const defaultConfig = Object.freeze({
     swcTraceProfiling: false,
     forceSwcTransforms: false,
     requestInsights: false,
+    devAndBuildOtel: false,
     swcPlugins: undefined,
     largePageDataBytes: 128 * 1000, // 128KB by default
     disablePostcssPresetEnv: undefined,
@@ -2690,6 +2696,7 @@ export interface NextConfigRuntime {
     | 'exposeTestingApiInProductionBuild'
     | 'instantInsights'
     | 'requestInsights'
+    | 'devAndBuildOtel'
     | 'externalBrowserRuntime'
   > & {
     // Pick on @internal fields generates invalid .d.ts files
@@ -2764,6 +2771,7 @@ export function getNextConfigRuntime(
     exposeTestingApiInProductionBuild: ex.exposeTestingApiInProductionBuild,
     instantInsights: ex.instantInsights,
     requestInsights: ex.requestInsights,
+    devAndBuildOtel: ex.devAndBuildOtel,
     externalBrowserRuntime: ex.externalBrowserRuntime,
 
     goRoutes: ex.goRoutes,

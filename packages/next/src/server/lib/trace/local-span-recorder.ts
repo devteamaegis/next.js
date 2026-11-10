@@ -93,9 +93,12 @@ export function createLocalSpan(
   let attributes = options.attributes as LocalSpanAttributes | undefined
   if (!recordSpans) {
     if (process.env.NEXT_RUNTIME !== 'edge') {
-      const { captureToolingSpanSource, normalizeToolingAttributes } =
-        (toolingTracing ??=
-          require('../../../trace/trace') as typeof import('../../../trace/trace'))
+      const {
+        captureToolingSpanSource,
+        normalizeToolingAttributes,
+        selectAdditionalToolingSignal,
+      } = (toolingTracing ??=
+        require('../../../trace/trace') as typeof import('../../../trace/trace'))
       source = captureToolingSpanSource(
         {
           parent:
@@ -109,6 +112,7 @@ export function createLocalSpan(
         parent ? toolingSources.get(parent) : undefined
       )
       attributes = normalizeToolingAttributes(options.attributes)
+      selectAdditionalToolingSignal(source, options.name)
     } else {
       throw new Error(
         'Default local file delivery is not available in the Edge runtime'

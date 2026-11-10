@@ -3,9 +3,3 @@ export async function register() {
     await (await import('./instrumentation-node')).register()
   }
 }
-
-export async function flushTraces() {
-  if (process.env.NEXT_RUNTIME === 'nodejs') {
-    await (await import('./instrumentation-node')).flushTraces()
-  }
-}

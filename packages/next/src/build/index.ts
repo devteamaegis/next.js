@@ -130,7 +130,14 @@ import { generateBuildId } from './generate-build-id'
 import { isWriteable } from './is-writeable'
 import * as Log from './output/log'
 import createSpinner, { finishSpinner } from './spinner'
-import { flushAllTraces, setGlobal } from '../trace'
+import {
+  exportTraceState,
+  flushAllTraces,
+  initializeTraceState,
+  recordTraceEvents,
+  setGlobal,
+} from '../trace'
+import { startToolingSpanReporting } from '../trace/trace'
 import type { Span } from '@opentelemetry/api'
 import { getTracer } from '../server/lib/trace/tracer'
 import { ToolingSpan } from '../server/lib/trace/constants'
@@ -1217,6 +1224,16 @@ export default async function build(
           )
       )
       loadedConfig = config
+      initializeTraceState({
+        ...exportTraceState(),
+        devAndBuildOtel: config.experimental.devAndBuildOtel,
+      })
+      // The root starts before config loading; keep that original timing.
+      startToolingSpanReporting(
+        getToolingSpanSource(nextBuildSpan)!,
+        ToolingSpan.nextBuild,
+        true
+      )
 
       // Resolve selective build paths now that the page extensions are known.
       const debugBuildPaths = debugBuildPathsPatterns
@@ -1266,6 +1283,18 @@ export default async function build(
       // events are captured if native bindings fail to load.
       const telemetry = new Telemetry({ distDir })
       setGlobal('telemetry', telemetry)
+      if (config.experimental.devAndBuildOtel) {
+        const { getToolingSessionAttributes } =
+          require('../trace/session') as typeof import('../trace/session')
+        nextBuildSpan.setAttributes(
+          getToolingSessionAttributes(
+            dir,
+            'build',
+            bundler === Bundler.Turbopack,
+            telemetry
+          )
+        )
+      }
 
       // Reuse the loaded config; ordinary builds do not load upgrade tooling.
       if (
@@ -1984,7 +2013,7 @@ export default async function build(
                     debuggerPortOffset: -1,
                     isolatedMemory: false,
                     numWorkers: 1,
-                    exposedMethods: ['collectBuildTraces'],
+                    exposedMethods: ['workerCollectBuildTraces'],
                     forkOptions: process.env.NEXT_CPU_PROF
                       ? {
                           env: {
@@ -2000,9 +2029,9 @@ export default async function build(
                 buildTracesPromise = getTracer().trace(
                   ToolingSpan.collectBuildTraces,
                   { parent: nextBuildSpan },
-                  () => {
+                  (collectSpan) => {
                     return buildTraceWorker
-                      .collectBuildTraces({
+                      .workerCollectBuildTraces({
                         dir,
                         config,
                         distDir,
@@ -2013,11 +2042,24 @@ export default async function build(
                         staticPages: [],
                         buildTraceContext,
                         outputFileTracingRoot,
+                        traceState: {
+                          ...exportTraceState(),
+                          defaultParentSpanId: getToolingSpanSource(
+                            collectSpan!
+                          )!.id,
+                        },
+                      })
+                      .then(({ events, traceState }) => {
+                        recordTraceEvents(
+                          events,
+                          traceState.toolingSpanSelections
+                        )
                       })
                       .catch((err) => {
                         console.error(err)
                         throw err
                       })
+                      .finally(() => buildTraceWorker.end())
                   }
                 )
               }
@@ -2399,7 +2441,7 @@ export default async function build(
 
       process.env.NEXT_PHASE = PHASE_PRODUCTION_BUILD
 
-      if (process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1') {
+      if (config.experimental.devAndBuildOtel) {
         const { registerToolingBuildInstrumentation } =
           require('../server/lib/router-utils/instrumentation-globals.external') as typeof import('../server/lib/router-utils/instrumentation-globals.external')
         await registerToolingBuildInstrumentation(
@@ -5078,10 +5120,10 @@ export default async function build(
 
     // Ensure all buffered spans are on disk before `uploadTrace` reads the file.
     flushAllTraces()
-    if (process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1') {
-      const { flushReporting } =
+    if (loadedConfig?.experimental.devAndBuildOtel) {
+      const { closeReporting } =
         require('../trace/otel') as typeof import('../trace/otel')
-      await flushReporting()
+      closeReporting()
     }
     teardownTraceSubscriber()
 

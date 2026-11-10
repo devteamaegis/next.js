@@ -47,8 +47,6 @@ export function getAllMemoryUsageSpans(): MemoryUsage[] {
 
 /**
  * Captures a memory usage snapshot for the process summary/debug report.
- * The existing tracing observation remains unended (and is not written to the
- * trace file); changing that lifetime is separate from recorder migration.
  */
 export function traceMemoryUsage(
   description: string,
@@ -75,7 +73,7 @@ export function traceMemoryUsage(
     name: 'memory-usage',
     parent: parentSpan,
     attributes: tracedMemoryUsageAsStrings,
-  })
+  }).end()
   if (process.env.EXPERIMENTAL_DEBUG_MEMORY_USAGE) {
     const percentageHeapUsed = (100 * heapUsed) / heapMax
 

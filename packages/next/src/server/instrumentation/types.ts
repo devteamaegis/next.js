@@ -22,8 +22,6 @@ export type InstrumentationOnRequestError = (
 
 export type InstrumentationModule = {
   register?(): void
-  /** Experimental tooling-only cooperative flush; not used by production requests. */
-  flushTraces?(): void | Promise<void>
   onRequestError?: InstrumentationOnRequestError
 }
 

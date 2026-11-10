@@ -1,4 +1,10 @@
-import type { Attributes, HrTime, Span, SpanContext } from '@opentelemetry/api'
+import type {
+  Attributes,
+  Histogram,
+  HrTime,
+  Span,
+  SpanContext,
+} from '@opentelemetry/api'
 import type { TraceEvent } from './types'
 
 // Accounting bounds for centrally retained metadata and UTF-16 snapshots, not
@@ -6,7 +12,6 @@ import type { TraceEvent } from './types'
 // independent. Reserve one slot and 512 bytes for the explicitly captured root.
 export const REPLAY_EVENT_LIMIT = 10_000
 export const REPLAY_BYTE_LIMIT = 8 * 1024 * 1024
-export const FLUSH_TIMEOUT_MS = 5_000
 const ROOT_BYTES = 512
 
 export type ReportingRecord = {
@@ -34,8 +39,6 @@ let suppressed = false
 let warned = false
 let retainedBytes = 0
 let defaultParent: ReportingRecord | undefined
-let flushHook: (() => void | Promise<void>) | undefined
-let finalization: Promise<void> | undefined
 // SDK callbacks may capture/end spans or reset/close the session. Finish such
 // captures after the active SDK call returns, without recursively entering it.
 let reporting = false
@@ -44,12 +47,68 @@ const records = new Set<ReportingRecord>()
 // Compiler workers allocate IDs independently. They share retention accounting,
 // but must not replace coordinator records used for numeric parent lookup.
 const coordinatorRecords = new Map<number, ReportingRecord>()
+const histograms = new Map<string, Histogram>()
+
+function reportMeasurements(record: ReportingRecord): boolean {
+  const memory = record.name === 'memory-usage'
+  const restart = record.name === 'server-restart-close-to-memory-threshold'
+  const native =
+    record.name === 'turbopack-persistence' ||
+    record.name === 'turbopack-compaction'
+  if (native && !record.span) return false
+  if ((!memory && !restart && !native) || record.end === undefined)
+    return memory || restart
+
+  const { api } = (backend ??=
+    require('../server/lib/trace/otel-api') as typeof import('../server/lib/trace/otel-api'))
+  const meter = api.metrics.getMeter('next.js', process.env.__NEXT_VERSION)
+  const parent =
+    record.context ?? record.parent?.context ?? defaultParent?.context
+  const context = parent
+    ? api.trace.setSpanContext(api.ROOT_CONTEXT, parent)
+    : api.ROOT_CONTEXT
+  const tags = attributes(record.encoded)
+  const measurements: [string, string, string][] = native
+    ? [
+        ['bytes_written', 'turbopack.bytes_written', 'By'],
+        ['bytes_deleted', 'turbopack.bytes_deleted', 'By'],
+        ['task_count', 'turbopack.task_count', '{task}'],
+      ]
+    : [
+        ['memory.rss', 'memory.rss', 'By'],
+        ['memory.heapUsed', 'memory.heap_used', 'By'],
+        ['memory.heapTotal', 'memory.heap_total', 'By'],
+        ['memory.heapMax', 'memory.heap_limit', 'By'],
+        ['memory.heapSizeLimit', 'memory.heap_limit', 'By'],
+      ]
+  // Paths and numeric trace IDs belong to traces, not metric dimensions.
+  const dimensions = { operation: record.name }
+  for (const [tag, suffix, unit] of measurements) {
+    if (tags[tag] === undefined) continue
+    const value = Number(tags[tag])
+    if (!Number.isFinite(value) || value < 0) continue
+    const name = `next.tooling.${suffix}`
+    let histogram = histograms.get(name)
+    if (!histogram) {
+      histogram = meter.createHistogram(name, { unit })
+      histograms.set(name, histogram)
+    }
+    if (!canEmit(record)) return memory || restart
+    histogram.record(value, dimensions, context)
+  }
+  if (restart && canEmit(record)) {
+    meter
+      .createCounter('next.tooling.server.restarts', { unit: '{restart}' })
+      .add(1, { reason: 'memory-threshold' }, context)
+  }
+  return memory || restart
+}
 
 function warnLoss() {
   if (!warned) {
     warned = true
     console.warn(
-      'Next.js tooling OTel reporting limit reached or reporting failed; some external spans or attributes may be missing. Local trace files are unaffected.'
+      'Next.js tooling OTel reporting limit reached or reporting failed; some external signals or attributes may be missing. Local trace files are unaffected.'
     )
   }
 }
@@ -107,6 +166,10 @@ function canEmit(record: ReportingRecord) {
 // this adapter or pay its application sampling/processor costs.
 function emit(record: ReportingRecord) {
   try {
+    if (reportMeasurements(record)) {
+      if (record.end !== undefined) release(record)
+      return
+    }
     const {
       api: { ROOT_CONTEXT, SpanStatusCode, trace },
       getTracerInstance,
@@ -148,6 +211,8 @@ function emit(record: ReportingRecord) {
       // Completion can itself happen reentrantly during startSpan/onStart.
       if (alreadyStarted || !completed)
         record.span.setAttributes(attributes(record.encoded))
+      if (!canEmit(record)) return
+      if (!alreadyStarted) reportMeasurements(record)
       if (!canEmit(record)) return
       if (record.failed) record.span.setStatus({ code: SpanStatusCode.ERROR })
       if (!canEmit(record)) return
@@ -233,8 +298,6 @@ function retain(
     generation++
     clearWork()
     defaultParent = undefined
-    flushHook = undefined
-    finalization = undefined
     state = 'unregistered'
     warned = false
   }
@@ -366,46 +429,14 @@ export function replayCompleted(
   report(batch.values())
 }
 
-export function enableReporting(hook?: () => void | Promise<void>) {
+export function enableReporting() {
   if (state !== 'unregistered' || suppressed) return
   state = 'ready'
-  flushHook = hook
   report(records.values())
 }
 
-export function flushReporting(): Promise<void> {
-  if (finalization) return finalization
-  if (state === 'closed') return Promise.resolve()
-  const current = generation
-  const hook = state === 'ready' ? flushHook : undefined
+export function closeReporting(): void {
   state = 'closed'
   clearWork()
   defaultParent = undefined
-  flushHook = undefined
-  // No private SDK-creation queue remains. Close intake before the optional app
-  // hook; never manufacture completion for a genuinely unfinished operation.
-  finalization = (async () => {
-    if (!hook) return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      await Promise.race([
-        Promise.resolve().then(() => {
-          if (current === generation) return hook()
-        }),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error('timeout')),
-            FLUSH_TIMEOUT_MS
-          )
-        }),
-      ])
-    } catch {
-      console.warn(
-        'Next.js tooling instrumentation.flushTraces() failed or timed out; local traces have already been flushed.'
-      )
-    } finally {
-      clearTimeout(timer)
-    }
-  })()
-  return finalization
 }

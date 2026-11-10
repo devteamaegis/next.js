@@ -10,6 +10,7 @@ export interface TraceState {
   lastId: number
   defaultParentSpanId?: SpanId
   shouldSaveTraceEvents?: boolean
+  devAndBuildOtel?: boolean
   /** Shared monotonic-to-epoch mapping for app-tracer worker replay. */
   otelClockOffset?: string
   /** Internal worker sidecar, never written to legacy trace files. */

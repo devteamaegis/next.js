@@ -1,4 +1,3 @@
-import { createServer, type Server } from 'node:http'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { isNextDev, nextTestSetup } from 'e2e-utils'
@@ -19,15 +18,24 @@ type ExportedSpan = {
   attributes: Record<string, unknown>
 }
 type Message = {
-  kind: 'register' | 'flush' | 'spans'
+  kind: 'register' | 'spans' | 'metrics'
   pid: number
   phase?: string
   installed?: boolean
+  metricsInstalled?: boolean
   identityStable?: boolean
   registrations?: number
   time?: number
-  localHasRoot?: boolean
   spans?: ExportedSpan[]
+  metrics?: {
+    name: string
+    unit: string
+    instrumentationScope: string
+    dataPoints: {
+      attributes: Record<string, unknown>
+      value: number | { count: number; sum: number; min: number; max: number }
+    }[]
+  }[]
   unfinished?: {
     name: string
     spanId: string
@@ -36,6 +44,26 @@ type Message = {
   }[]
 }
 const selectedNames = new Set([
+  'dev-server-session',
+  'render-path',
+  'navigation-to-hydration',
+  'turbopack-persistence',
+  'turbopack-compaction',
+  'turbopack-module-graph',
+  'turbopack-write-entrypoints',
+  'turbopack-emit',
+  'create-entrypoints',
+  'make',
+  'seal',
+  'chunk-graph',
+  'optimize-modules',
+  'optimize-chunks',
+  'optimize',
+  'optimize-tree',
+  'optimize-chunk-modules',
+  'module-hash',
+  'node-file-trace-build',
+  'next-export',
   'client-hmr-latency',
   'next-build',
   'run-webpack',
@@ -59,22 +87,21 @@ const selectedNames = new Set([
 const milliseconds = ([seconds, ns]: [number, number]) =>
   seconds * 1000 + ns / 1e6
 
-async function startCollector(messages: Message[]) {
-  const collector = createServer(async (request, response) => {
-    const chunks: Buffer[] = []
-    for await (const chunk of request) chunks.push(Buffer.from(chunk))
-    messages.push(JSON.parse(Buffer.concat(chunks).toString()))
-    response.end('ok')
-  })
-  await new Promise<void>((resolve) =>
-    collector.listen(0, '127.0.0.1', resolve)
-  )
-  return collector
+function readMessages(output: string): Message[] {
+  return output
+    .split('\n')
+    .slice(0, -1)
+    .flatMap((line) => {
+      const marker = '[tooling-otel]'
+      const index = line.indexOf(marker)
+      return index === -1 ? [] : [JSON.parse(line.slice(index + marker.length))]
+    })
 }
 
 const dependencies = {
   '@opentelemetry/api': '1.9.0',
   '@opentelemetry/sdk-trace': '2.12.0',
+  '@opentelemetry/sdk-metrics': '2.12.0',
 }
 
 const providerCases = (
@@ -84,320 +111,536 @@ const providerCases = (
     name: `${sampler} sampler, ${distDir} output`,
     sampler,
     distDir,
-    toolingGate: process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING ?? '1',
+    toolingEnabled: true as boolean | undefined,
   }))
 )
-if (isNextDev) {
+for (const toolingEnabled of [false, undefined]) {
   providerCases.push({
-    name: 'disabled tooling, .next output',
+    name: `${toolingEnabled === false ? 'disabled' : 'default'} tooling`,
     sampler: 'on',
-    distDir: '.next',
-    toolingGate: '0',
+    distDir: 'otel-output',
+    toolingEnabled,
   })
 }
 
-// Local files, local collector, and CLI process shutdown are self-hosted contracts.
+// Local files, SDK output, and CLI process shutdown are self-hosted contracts.
 // @force-gate !deploy
 describe('experimental tooling OTel', () => {
-  describe.each(providerCases)('$name', ({ sampler, distDir, toolingGate }) => {
-    let startCommand: string | undefined
-    if (isNextDev) {
-      const bundlerFlag = process.env.IS_WEBPACK_TEST
-        ? '--webpack'
-        : '--turbopack'
-      startCommand = `node node_modules/next/dist/bin/next ${bundlerFlag}`
-    }
-    const { next } = nextTestSetup({
-      files: __dirname,
-      skipStart: true,
-      startCommand,
-      dependencies,
-      env: {
-        NEXT_EXPERIMENTAL_OTEL_TOOLING: toolingGate,
-        NEXT_EXIT_TIMEOUT_MS: '30000',
-        TOOLING_SAMPLER: sampler,
-      },
-    })
-    const messages: Message[] = []
-    let collector: Server
-
-    beforeAll(async () => {
-      collector = await startCollector(messages)
-      const address = collector.address() as { port: number }
-      next.env.TOOLING_ENDPOINT = `http://127.0.0.1:${address.port}`
-      if (isNextDev && distDir === '.next') {
-        // Keep the default legacy path and the existing custom-dev path covered.
-        await next.patchFile('next.config.ts', (source) =>
-          source.replace("'otel-output'", "'.next'")
-        )
-      }
-      next.env.TOOLING_TRACE_FILE = join(
-        distDir,
-        ...(isNextDev ? ['dev'] : []),
-        'trace'
-      )
-      await next.start()
-    })
-
-    afterAll(async () => {
-      await next.stop('SIGTERM')
-      await new Promise<void>((resolve) => collector?.close(() => resolve()))
-    })
-
-    it('keeps local files independent while exporting through the application provider', async () => {
-      expect(await next.render('/')).toContain('hello world')
-      let clientLatency: number | undefined
-      let editStartedAt = Date.now()
+  describe.each(providerCases)(
+    '$name',
+    ({ sampler, distDir, toolingEnabled }) => {
+      let startCommand: string | undefined
       if (isNextDev) {
-        const browser = await next.browser('/')
-        await browser.eval(`
+        const bundlerFlag = process.env.IS_WEBPACK_TEST
+          ? '--webpack'
+          : '--turbopack'
+        startCommand = `node node_modules/next/dist/bin/next ${bundlerFlag}`
+      }
+      const { next } = nextTestSetup({
+        files: __dirname,
+        skipStart: true,
+        startCommand,
+        dependencies,
+        env: {
+          ...(isNextDev &&
+          distDir === '.next' &&
+          sampler === 'on' &&
+          toolingEnabled
+            ? {}
+            : { NEXT_EXIT_TIMEOUT_MS: '30000' }),
+          TOOLING_SAMPLER: sampler,
+        },
+      })
+      const messages = () => readMessages(next.cliOutput)
+
+      beforeAll(async () => {
+        if (toolingEnabled !== true) {
+          await next.patchFile('next.config.ts', (source) =>
+            source.replace(
+              'devAndBuildOtel: true',
+              `devAndBuildOtel: ${toolingEnabled}`
+            )
+          )
+        }
+        if (isNextDev && distDir === '.next') {
+          // Keep the default legacy path and the existing custom-dev path covered.
+          await next.patchFile('next.config.ts', (source) =>
+            source.replace("'otel-output'", "'.next'")
+          )
+        }
+        next.env.TOOLING_TRACE_FILE = join(
+          distDir,
+          ...(isNextDev ? ['dev'] : []),
+          'trace'
+        )
+        await next.start()
+      })
+
+      afterAll(async () => {
+        await next.stop('SIGTERM')
+      })
+
+      it('keeps local files independent while exporting through the application provider', async () => {
+        expect(await next.render('/')).toContain('hello world')
+        let clientLatency: number | undefined
+        let editStartedAt = Date.now()
+        if (isNextDev) {
+          const pagesBrowser = await next.browser('/legacy-pages')
+          expect(await pagesBrowser.elementByCss('p').text()).toBe(
+            'pages hydrated'
+          )
+          await retry(async () => {
+            expect(
+              (await pagesBrowser.log()).some((entry) =>
+                entry.message.includes('[HMR] connected')
+              )
+            ).toBe(true)
+          })
+          await pagesBrowser.close()
+          const browser = await next.browser('/')
+          await browser.eval(`
           window.__toolingHmrDocument = true
           window.__NEXT_HMR_LATENCY_CB = (latency) => {
             window.__toolingHmrLatency = latency
           }
         `)
-        editStartedAt = Date.now()
-        await next.patchFile('app/page.tsx', (source) =>
-          source.replace('hello world', 'edited page')
-        )
-        await retry(async () => {
-          expect(await browser.elementByCss('p').text()).toBe('edited page')
-          expect(await browser.eval('window.__toolingHmrDocument')).toBe(true)
-          expect(await browser.eval('window.__toolingHmrLatency')).toEqual(
-            expect.any(Number)
+          editStartedAt = Date.now()
+          await next.patchFile('app/page.tsx', (source) =>
+            source.replace('hello world', 'edited page')
           )
-        })
-        clientLatency = await browser.eval('window.__toolingHmrLatency')
-        await browser.close()
-      }
-      const editFinishedAt = Date.now()
-      if (
-        isNextDev &&
-        sampler === 'on' &&
-        next.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1'
-      ) {
-        await retry(async () => {
-          const exported = messages.flatMap((message) => message.spans ?? [])
-          expect(exported).toEqual(
+          await retry(async () => {
+            expect(await browser.elementByCss('p').text()).toBe('edited page')
+            expect(await browser.eval('window.__toolingHmrDocument')).toBe(true)
+            expect(await browser.eval('window.__toolingHmrLatency')).toEqual(
+              expect.any(Number)
+            )
+          })
+          clientLatency = await browser.eval('window.__toolingHmrLatency')
+          await browser.close()
+        }
+        const editFinishedAt = Date.now()
+        if (isNextDev && sampler === 'on' && toolingEnabled) {
+          await retry(async () => {
+            const exported = messages().flatMap(
+              (message) => message.spans ?? []
+            )
+            expect(exported).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  name: 'client-hmr-latency',
+                  attributes: expect.objectContaining({ page: '/' }),
+                }),
+                expect.objectContaining({ name: 'compile-path' }),
+              ])
+            )
+          }, 15000)
+        }
+        await next.stop('SIGTERM')
+        const local = parseTraceFile(
+          join(next.testDir, next.env.TOOLING_TRACE_FILE)
+        ).events
+        expectTraceEventContract(local)
+        if (isNextDev) {
+          expect(local.map((event) => event.name)).toEqual(
             expect.arrayContaining([
-              expect.objectContaining({
-                name: 'client-hmr-latency',
-                attributes: expect.objectContaining({ page: '/' }),
-              }),
-              expect.objectContaining({ name: 'compile-path' }),
+              'start-dev-server',
+              'setup-dev-bundler',
+              'hot-reloader',
+              'compile-path',
+              'client-hmr-latency',
+              'render-path',
+              'navigation-to-hydration',
+              'memory-usage',
+              ...(process.env.IS_WEBPACK_TEST ? ['webpack-compilation'] : []),
             ])
           )
-        }, 15000)
-        expect(messages.filter((message) => message.kind === 'flush')).toEqual(
-          []
-        )
-      }
-      await next.stop('SIGTERM')
-      const local = parseTraceFile(
-        join(next.testDir, next.env.TOOLING_TRACE_FILE)
-      ).events
-      expectTraceEventContract(local)
-      if (isNextDev) {
-        expect(local.map((event) => event.name)).toEqual(
-          expect.arrayContaining([
-            'start-dev-server',
-            'setup-dev-bundler',
-            'hot-reloader',
-            'compile-path',
-            'client-hmr-latency',
-            ...(process.env.IS_WEBPACK_TEST ? ['webpack-compilation'] : []),
+        } else {
+          expect(local.map((event) => event.name)).toEqual(
+            expect.arrayContaining([
+              'next-build',
+              'static-check',
+              'static-generation',
+              'next-export',
+              'run-typescript',
+              'memory-usage',
+              ...(process.env.IS_WEBPACK_TEST
+                ? [
+                    'create-entrypoints',
+                    'webpack-compilation',
+                    'make',
+                    'seal',
+                    'chunk-graph',
+                    'optimize-modules',
+                    'optimize-chunks',
+                    'optimize',
+                    'optimize-tree',
+                    'optimize-chunk-modules',
+                    'module-hash',
+                    'node-file-trace-build',
+                  ]
+                : [
+                    'turbopack-module-graph',
+                    'turbopack-write-entrypoints',
+                    'turbopack-emit',
+                    'turbopack-persistence',
+                  ]),
+            ])
+          )
+        }
+        const clientEvent = local
+          .filter(
+            (event) =>
+              event.name === 'client-hmr-latency' &&
+              event.tags.page === '/' &&
+              event.startTime !== undefined &&
+              event.startTime >= editStartedAt - 10
+          )
+          .at(-1)
+        if (isNextDev) {
+          expect(clientEvent).toBeDefined()
+          expect(clientEvent!.startTime).toBeGreaterThanOrEqual(
+            editStartedAt - 10
+          )
+          expect(clientEvent!.startTime).toBeLessThanOrEqual(editFinishedAt)
+          expect(clientEvent!.duration).toBe(clientLatency! * 1000)
+          expect(clientEvent!.tags).toMatchObject({
+            page: '/',
+            isPageHidden: expect.any(Boolean),
+          })
+          expect(Object.keys(clientEvent!.tags).sort()).toEqual([
+            'isPageHidden',
+            'page',
+            'updatedModules',
           ])
+          expect(clientEvent!.tags.updatedModules).toBeDefined()
+          const parent = local.find(
+            (event) => event.id === clientEvent!.parentId
+          )
+          expect(parent?.name).toBe('hot-reloader')
+          expect(clientEvent!.traceId).toBe(parent!.traceId)
+        }
+        const rootName = isNextDev ? 'dev-server-session' : 'next-build'
+        expect(local.some((event) => event.name === rootName)).toBe(true)
+        // Fine observations remain in the full local hierarchy, never the SDK lane.
+        expect(local.some((event) => !selectedNames.has(event.name))).toBe(true)
+        const registrations = messages().filter(
+          (message) => message.kind === 'register'
         )
-      }
-      const clientEvent = local
-        .filter(
-          (event) =>
-            event.name === 'client-hmr-latency' &&
-            event.tags.page === '/' &&
-            event.startTime !== undefined &&
-            event.startTime >= editStartedAt - 10
-        )
-        .at(-1)
-      if (isNextDev) {
-        expect(clientEvent).toBeDefined()
-        expect(clientEvent!.startTime).toBeGreaterThanOrEqual(
-          editStartedAt - 10
-        )
-        expect(clientEvent!.startTime).toBeLessThanOrEqual(editFinishedAt)
-        expect(clientEvent!.duration).toBe(clientLatency! * 1000)
-        expect(clientEvent!.tags).toMatchObject({
-          page: '/',
-          isPageHidden: expect.any(Boolean),
-        })
-        expect(Object.keys(clientEvent!.tags).sort()).toEqual([
-          'isPageHidden',
-          'page',
-          'updatedModules',
-        ])
-        expect(clientEvent!.tags.updatedModules).toBeDefined()
-        const parent = local.find((event) => event.id === clientEvent!.parentId)
-        expect(parent?.name).toBe('hot-reloader')
-        expect(clientEvent!.traceId).toBe(parent!.traceId)
-      }
-      const rootName = isNextDev ? 'start-dev-server' : 'next-build'
-      expect(local.some((event) => event.name === rootName)).toBe(true)
-      // Fine observations remain in the full local hierarchy, never the SDK lane.
-      expect(local.some((event) => !selectedNames.has(event.name))).toBe(true)
-      const flushes = messages.filter((message) => message.kind === 'flush')
-      const registrations = messages.filter(
-        (message) => message.kind === 'register'
-      )
-      if (next.env.NEXT_EXPERIMENTAL_OTEL_TOOLING !== '1') {
-        expect(flushes).toHaveLength(0)
-        expect(registrations).toHaveLength(1)
-        expect(registrations[0]).toMatchObject({
+        if (!toolingEnabled) {
+          expect(registrations).toHaveLength(1)
+          expect(registrations[0]).toMatchObject({
+            installed: true,
+            registrations: 1,
+          })
+          if (!isNextDev)
+            expect(registrations[0].phase).not.toBe('phase-production-build')
+          expect(
+            messages()
+              .flatMap((message) => message.spans ?? [])
+              .filter(
+                (span) => span.attributes['next.tooling.id'] !== undefined
+              )
+          ).toEqual([])
+          expect(
+            messages().flatMap((message) => message.metrics ?? [])
+          ).toEqual([])
+          return
+        }
+        expect(registrations).not.toHaveLength(0)
+        const registration = registrations[0]
+        expect(
+          messages()
+            .filter((message) => message.pid === registration.pid)
+            .every((message) => message.identityStable)
+        ).toBe(true)
+        expect(registration).toMatchObject({
           installed: true,
+          metricsInstalled: true,
           registrations: 1,
         })
-        if (!isNextDev)
-          expect(registrations[0].phase).not.toBe('phase-production-build')
-        expect(
-          messages
-            .flatMap((message) => message.spans ?? [])
-            .filter((span) => span.attributes['next.tooling.id'] !== undefined)
-        ).toEqual([])
-        return
-      }
-      expect(registrations).not.toHaveLength(0)
-      expect(flushes).toHaveLength(1)
-      expect(flushes[0]).toMatchObject({
-        registrations: 1,
-        localHasRoot: true,
-        identityStable: true,
-      })
-      const registration = messages.find(
-        (message) =>
-          message.kind === 'register' && message.pid === flushes[0].pid
-      )!
-      expect(registration).toMatchObject({ installed: true, registrations: 1 })
-      const allSpans = messages.flatMap((message) => message.spans ?? [])
-      const tooling = allSpans.filter(
-        (span) => span.attributes['next.tooling.id'] !== undefined
-      )
-      if (sampler === 'off') {
-        expect(tooling).toHaveLength(0)
-        return
-      }
-      if (isNextDev) {
+        const exportedMetrics = messages().flatMap(
+          (message) => message.metrics ?? []
+        )
+        const memory = local.filter((event) => event.name === 'memory-usage')
+        expect(memory.length).toBeGreaterThan(0)
+        for (const [tag, suffix] of [
+          ['memory.rss', 'rss'],
+          ['memory.heapUsed', 'heap_used'],
+          ['memory.heapTotal', 'heap_total'],
+        ]) {
+          const values = memory.map((event) => Number(event.tags[tag]))
+          expect(values.every((value) => value > 0)).toBe(true)
+          const metric = exportedMetrics
+            .filter((item) => item.name === `next.tooling.memory.${suffix}`)
+            .at(-1)!
+          const count = (metric?.dataPoints[0]?.value as { count: number })
+            ?.count
+          expect(count).toBeGreaterThan(0)
+          expect(count).toBeLessThanOrEqual(values.length)
+          const sampledValues = values.slice(0, count)
+          expect(metric).toMatchObject({
+            unit: 'By',
+            instrumentationScope: 'next.js',
+            dataPoints: [
+              {
+                attributes: { operation: 'memory-usage' },
+                value: expect.objectContaining({
+                  count,
+                  sum: sampledValues.reduce((sum, value) => sum + value, 0),
+                  min: Math.min(...sampledValues),
+                  max: Math.max(...sampledValues),
+                }),
+              },
+            ],
+          })
+        }
+        for (const operation of [
+          'turbopack-persistence',
+          'turbopack-compaction',
+        ]) {
+          const observations = local.filter((event) => event.name === operation)
+          if (!observations.length) continue
+          for (const tag of [
+            'bytes_written',
+            'bytes_deleted',
+            ...(operation === 'turbopack-persistence' ? ['task_count'] : []),
+          ]) {
+            const values = observations.map((event) => Number(event.tags[tag]))
+            expect(
+              values.every((value) => Number.isFinite(value) && value >= 0)
+            ).toBe(true)
+            const metric = exportedMetrics
+              .filter((item) => item.name === `next.tooling.turbopack.${tag}`)
+              .at(-1)!
+            const count = (metric?.dataPoints[0]?.value as { count: number })
+              ?.count
+            expect(count).toBeGreaterThan(0)
+            expect(count).toBeLessThanOrEqual(values.length)
+            const sampledValues = values.slice(0, count)
+            expect(metric.dataPoints).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  attributes: { operation },
+                  value: expect.objectContaining({
+                    count,
+                    sum: sampledValues.reduce((sum, value) => sum + value, 0),
+                    min: Math.min(...sampledValues),
+                    max: Math.max(...sampledValues),
+                  }),
+                }),
+              ])
+            )
+          }
+        }
+        const allSpans = messages().flatMap((message) => message.spans ?? [])
+        const tooling = allSpans.filter(
+          (span) => span.attributes['next.tooling.id'] !== undefined
+        )
+        if (sampler === 'off') {
+          expect(tooling).toHaveLength(0)
+          return
+        }
         const expected = local.filter((event) => selectedNames.has(event.name))
         expect(
           tooling
             .map((span) => span.attributes['next.tooling.id'] as number)
             .sort((a, b) => a - b)
         ).toEqual(expected.map((event) => event.id).sort((a, b) => a - b))
-      }
-      expect(tooling.map((span) => span.name)).toContain(rootName)
-      const root = tooling.find((span) => span.name === rootName)!
-      expect(root).toBeDefined()
-      expect(root.parentSpanId).toBeUndefined()
-      expect(milliseconds(root.startTime)).toBeLessThan(registration.time!)
-      expect(milliseconds(root.endTime)).toBeGreaterThanOrEqual(
-        registration.time!
-      )
-      const early = tooling.filter(
-        (span) => milliseconds(span.endTime) <= registration.time!
-      )
-      expect(early.length).toBeGreaterThan(0)
-      expect(
-        new Set(tooling.map((span) => span.attributes['next.tooling.id'])).size
-      ).toBe(tooling.length)
-      const spansById = new Map(tooling.map((span) => [span.spanId, span]))
-      const allSpansById = new Map(allSpans.map((span) => [span.spanId, span]))
-      const orphans = tooling.filter(
-        (span) => span.parentSpanId && !spansById.has(span.parentSpanId)
-      )
-      const unfinishedById = new Map(
-        flushes[0].unfinished?.map((span) => [span.spanId, span])
-      )
-      // A framework operation that never ends is absent from both the local
-      // file and completed SDK exports. Require proof that its real parent
-      // remains live, rather than fabricating an end or ignoring lost exports.
-      const missingParents = orphans.filter((span) => {
-        const parent = unfinishedById.get(span.parentSpanId!)
-        return (
-          !parent ||
-          parent.traceId !== span.traceId ||
-          parent.toolingId !== span.attributes['next.tooling.parent_id']
-        )
-      })
-      expect(
-        missingParents.slice(0, 5).map((span) => {
-          const parent = allSpansById.get(span.parentSpanId!)
-          return {
-            name: span.name,
-            id: span.attributes['next.tooling.id'],
-            parentSpanId: span.parentSpanId,
-            parentName: parent?.name,
-            parentAttributeCount: Object.keys(parent?.attributes ?? {}).length,
-            parentToolingId: span.attributes['next.tooling.parent_id'],
-            localParentName: local.find(
-              (event) => event.id === span.attributes['next.tooling.parent_id']
-            )?.name,
-            unfinishedParent: flushes[0].unfinished?.find(
-              (unfinishedSpan) => unfinishedSpan.spanId === span.parentSpanId
-            ),
-          }
+        expect(tooling.map((span) => span.name)).toContain(rootName)
+        const root = tooling.find((span) => span.name === rootName)!
+        expect(root).toBeDefined()
+        expect(root.attributes).toMatchObject({
+          'next.tooling.session_id': expect.any(String),
+          'next.tooling.telemetry_session_id': expect.any(String),
+          'next.tooling.anonymous_id': expect.any(String),
+          'next.tooling.arch': process.arch,
+          'next.tooling.platform': process.platform,
+          'next.tooling.cpus': expect.any(Number),
+          'next.tooling.mode': isNextDev ? 'dev' : 'build',
+          'next.tooling.turbopack': !process.env.IS_WEBPACK_TEST,
+          'next.tooling.package_name': expect.any(String),
+          'next.tooling.branch': expect.any(String),
+          'next.tooling.commit': expect.any(String),
+          'next.tooling.version': expect.any(String),
         })
-      ).toEqual([])
-      for (const span of orphans) {
-        const parent = unfinishedById.get(span.parentSpanId!)!
-        expect(local.some((event) => event.id === parent.toolingId)).toBe(false)
-      }
-      const localById = new Map(local.map((event) => [event.id, event]))
-      for (const span of tooling) {
-        expect(span.traceId).toBe(root.traceId)
-        expect(span.instrumentationScope).toBe('next.js')
-        expect(selectedNames.has(span.name)).toBe(true)
-        const event = localById.get(
-          span.attributes['next.tooling.id'] as number
-        )!
-        expect(event).toBeDefined()
-        expect(event.name).toBe(span.name)
+        expect(root.attributes['next.tooling.session_id']).not.toBe('')
         if (isNextDev) {
+          expect(root.attributes['exit.reason']).toBe('SIGTERM')
+          expect(
+            tooling.find((span) => span.name === 'start-dev-server')
+          ).toMatchObject({
+            parentSpanId: root.spanId,
+          })
+        }
+        expect(root.parentSpanId).toBeUndefined()
+        expect(milliseconds(root.startTime)).toBeLessThan(registration.time!)
+        expect(milliseconds(root.endTime)).toBeGreaterThanOrEqual(
+          registration.time!
+        )
+        const early = tooling.filter(
+          (span) => milliseconds(span.endTime) <= registration.time!
+        )
+        expect(early.length).toBeGreaterThan(0)
+        expect(
+          new Set(tooling.map((span) => span.attributes['next.tooling.id']))
+            .size
+        ).toBe(tooling.length)
+        const spansById = new Map(tooling.map((span) => [span.spanId, span]))
+        const allSpansById = new Map(
+          allSpans.map((span) => [span.spanId, span])
+        )
+        const orphans = tooling.filter(
+          (span) => span.parentSpanId && !spansById.has(span.parentSpanId)
+        )
+        const unfinishedById = new Map(
+          messages()
+            .filter(
+              (message) =>
+                message.pid === registration.pid && message.kind === 'spans'
+            )
+            .at(-1)
+            ?.unfinished?.map((span) => [span.spanId, span])
+        )
+        // A framework operation that never ends is absent from both the local
+        // file and completed SDK exports. Require proof that its real parent
+        // remains live, rather than fabricating an end or ignoring lost exports.
+        const missingParents = orphans.filter((span) => {
+          const parent = unfinishedById.get(span.parentSpanId!)
+          return (
+            !parent ||
+            parent.traceId !== span.traceId ||
+            parent.toolingId !== span.attributes['next.tooling.parent_id']
+          )
+        })
+        expect(
+          missingParents.slice(0, 5).map((span) => {
+            const parent = allSpansById.get(span.parentSpanId!)
+            return {
+              name: span.name,
+              id: span.attributes['next.tooling.id'],
+              parentSpanId: span.parentSpanId,
+              parentName: parent?.name,
+              parentAttributeCount: Object.keys(parent?.attributes ?? {})
+                .length,
+              parentToolingId: span.attributes['next.tooling.parent_id'],
+              localParentName: local.find(
+                (event) =>
+                  event.id === span.attributes['next.tooling.parent_id']
+              )?.name,
+              unfinishedParent: unfinishedById.get(span.parentSpanId!),
+            }
+          })
+        ).toEqual([])
+        for (const span of orphans) {
+          const parent = unfinishedById.get(span.parentSpanId!)!
+          expect(local.some((event) => event.id === parent.toolingId)).toBe(
+            false
+          )
+        }
+        const localById = new Map(local.map((event) => [event.id, event]))
+        for (const span of tooling) {
+          expect(span.traceId).toBe(root.traceId)
+          expect(span.instrumentationScope).toBe('next.js')
+          expect(selectedNames.has(span.name)).toBe(true)
+          const event = localById.get(
+            span.attributes['next.tooling.id'] as number
+          )!
+          expect(event).toBeDefined()
+          expect(event.name).toBe(span.name)
           for (const [key, value] of Object.entries(event.tags)) {
             expect(span.attributes[key]).toEqual(
               typeof value === 'object' ? JSON.stringify(value) : value
             )
           }
-        }
-        expect(span.attributes['next.tooling.parent_id']).toBe(event.parentId)
-        expect(
-          Math.abs(milliseconds(span.startTime) - event.startTime!)
-        ).toBeLessThan(5)
-        expect(
-          Math.abs(
-            milliseconds(span.endTime) -
-              milliseconds(span.startTime) -
-              event.duration / 1000
-          )
-        ).toBeLessThan(1)
-        const parent = span.parentSpanId && spansById.get(span.parentSpanId)
-        if (parent) {
-          // Skip omitted fine ancestors in the SDK tree, not in local files.
-          let parentId = event.parentId
-          const seen = new Set<number>()
-          while (parentId !== undefined && !seen.has(parentId)) {
-            seen.add(parentId)
-            const localParent = localById.get(parentId)
-            if (!localParent || selectedNames.has(localParent.name)) break
-            parentId = localParent.parentId
+          expect(span.attributes['next.tooling.parent_id']).toBe(event.parentId)
+          expect(
+            Math.abs(milliseconds(span.startTime) - event.startTime!)
+          ).toBeLessThan(5)
+          expect(
+            Math.abs(
+              milliseconds(span.endTime) -
+                milliseconds(span.startTime) -
+                event.duration / 1000
+            )
+          ).toBeLessThan(1)
+          const parent = span.parentSpanId && spansById.get(span.parentSpanId)
+          if (parent) {
+            // Skip omitted fine ancestors in the SDK tree, not in local files.
+            let parentId = event.parentId
+            const seen = new Set<number>()
+            while (parentId !== undefined && !seen.has(parentId)) {
+              seen.add(parentId)
+              const localParent = localById.get(parentId)
+              if (!localParent || selectedNames.has(localParent.name)) break
+              parentId = localParent.parentId
+            }
+            expect(parent.attributes['next.tooling.id']).toBe(parentId)
           }
-          expect(parent.attributes['next.tooling.id']).toBe(parentId)
         }
-      }
-      if (!isNextDev && process.env.IS_WEBPACK_TEST) {
-        const workers = tooling.filter((span) =>
-          span.name.startsWith('worker-main-')
+        if (!isNextDev && process.env.IS_WEBPACK_TEST) {
+          const workers = tooling.filter((span) =>
+            span.name.startsWith('worker-main-')
+          )
+          expect(workers.length).toBeGreaterThan(0)
+          for (const worker of workers)
+            expect(worker.parentSpanId).toBe(root.spanId)
+        }
+      })
+    }
+  )
+
+  // Restart and child-process lifetime are dev-server contracts.
+  // @force-gate dev
+  describe.each(['on', 'off'])('memory restart, %s sampler', (sampler) => {
+    const { next } = nextTestSetup({
+      files: __dirname,
+      skipStart: true,
+      startCommand: `node node_modules/next/dist/bin/next ${process.env.IS_WEBPACK_TEST ? '--webpack' : '--turbopack'}`,
+      dependencies,
+      env: {
+        NEXT_EXIT_TIMEOUT_MS: '30000',
+        TOOLING_SAMPLER: sampler,
+        TOOLING_TRACE_FILE: join('otel-output', 'dev', 'trace'),
+      },
+    })
+    const messages = () => readMessages(next.cliOutput)
+
+    beforeAll(async () => {
+      await next.start()
+    })
+    afterAll(async () => {
+      await next.stop('SIGTERM')
+    })
+
+    it('reports the completed process session before restarting', async () => {
+      await next.render('/')
+      const registration = messages().find(
+        (message) => message.kind === 'register'
+      )!
+      expect(registration).toBeDefined()
+      expect(await (await next.fetch('/api/restart-memory')).json()).toEqual({
+        restarting: true,
+      })
+      await retry(async () => {
+        const processMessages = messages().filter(
+          (message) => message.pid === registration.pid
         )
-        expect(workers.length).toBeGreaterThan(0)
-        for (const worker of workers)
-          expect(worker.parentSpanId).toBe(root.spanId)
-      }
+        const sessions = processMessages
+          .flatMap((message) => message.spans ?? [])
+          .filter((span) => span.name === 'dev-server-session')
+        if (sampler === 'off') expect(sessions).toEqual([])
+        else {
+          expect(sessions).toHaveLength(1)
+          expect(sessions[0].attributes['exit.reason']).toBe('memory-threshold')
+        }
+        expect(
+          messages().some(
+            (message) =>
+              message.kind === 'register' && message.pid !== registration.pid
+          )
+        ).toBe(true)
+      }, 30000)
+      expect(await next.render('/')).toContain('hello world')
     })
   })
 
@@ -408,25 +651,19 @@ describe('experimental tooling OTel', () => {
       files: __dirname,
       skipStart: true,
       dependencies,
-      env: { NEXT_EXPERIMENTAL_OTEL_TOOLING: '1', TOOLING_SAMPLER: 'on' },
+      env: { TOOLING_SAMPLER: 'on' },
     })
-    const messages: Message[] = []
-    let collector: Server
+    const messages = () => readMessages(next.cliOutput)
 
     beforeAll(async () => {
-      collector = await startCollector(messages)
-      next.env.TOOLING_ENDPOINT = `http://127.0.0.1:${(collector.address() as { port: number }).port}`
       next.env.TOOLING_TRACE_FILE = join('otel-output', 'trace')
-    })
-    afterAll(async () => {
-      await new Promise<void>((resolve) => collector?.close(() => resolve()))
     })
 
     it('retains both parallel worker results locally and in the application provider', async () => {
       await next.patchFile('next.config.ts', (source) =>
         source.replace(
-          "distDir: 'otel-output'",
-          "distDir: 'otel-output', experimental: { webpackBuildWorker: true, parallelServerCompiles: true }"
+          'devAndBuildOtel: true',
+          'devAndBuildOtel: true, webpackBuildWorker: true, parallelServerCompiles: true, parallelServerBuildTraces: true'
         )
       )
       await next.patchFile(
@@ -437,9 +674,35 @@ describe('experimental tooling OTel', () => {
       const local = parseTraceFile(
         join(next.testDir, next.env.TOOLING_TRACE_FILE)
       ).events
-      const exported = messages.flatMap((message) => message.spans ?? [])
+      const exported = messages().flatMap((message) => message.spans ?? [])
       const root = exported.find((span) => span.name === 'next-build')!
       expect(root).toBeDefined()
+      const correlation = (name: string, id: unknown, parentId: unknown) =>
+        JSON.stringify([name, id, parentId])
+      expect(
+        exported
+          .filter((span) => span.attributes['next.tooling.id'] !== undefined)
+          .map((span) =>
+            correlation(
+              span.name,
+              span.attributes['next.tooling.id'],
+              span.attributes['next.tooling.parent_id']
+            )
+          )
+          .sort()
+      ).toEqual(
+        local
+          .filter((event) => selectedNames.has(event.name))
+          .map((event) => correlation(event.name, event.id, event.parentId))
+          .sort()
+      )
+      const fileTrace = exported.filter(
+        (span) => span.name === 'node-file-trace-build'
+      )
+      expect(fileTrace).toHaveLength(1)
+      expect(fileTrace[0].parentSpanId).toBe(
+        exported.find((span) => span.name === 'collect-build-traces')?.spanId
+      )
       for (const compiler of ['server', 'edge-server', 'client']) {
         const name = `worker-main-${compiler}`
         const events = local.filter((event) => event.name === name)
@@ -465,15 +728,19 @@ describe('experimental tooling OTel', () => {
       files: __dirname,
       skipStart: true,
       dependencies,
-      env: { NEXT_EXPERIMENTAL_OTEL_TOOLING: '1' },
     })
 
     it('completes the compiler span when config setup throws', async () => {
       await next.patchFile('next.config.ts', (source) =>
-        source.replace(
-          "distDir: 'otel-output'",
-          "distDir: 'otel-output', experimental: { webpackBuildWorker: false }, webpack() { throw new Error('tooling-webpack-setup-failure') }"
-        )
+        source
+          .replace(
+            "distDir: 'otel-output'",
+            "distDir: 'otel-output', webpack() { throw new Error('tooling-webpack-setup-failure') }"
+          )
+          .replace(
+            'devAndBuildOtel: true',
+            'devAndBuildOtel: true, webpackBuildWorker: false'
+          )
       )
       const { exitCode, cliOutput } = await next.build()
       expect(exitCode).not.toBe(0)
@@ -513,7 +780,6 @@ describe('experimental tooling OTel', () => {
         files: __dirname,
         skipStart: true,
         dependencies,
-        env: { NEXT_EXPERIMENTAL_OTEL_TOOLING: '1' },
       })
 
       it('does not run stale instrumentation after its source entry is removed', async () => {
@@ -545,21 +811,15 @@ describe('experimental tooling OTel', () => {
         files: __dirname,
         skipStart: true,
         dependencies,
-        env: { NEXT_EXPERIMENTAL_OTEL_TOOLING: '1', TOOLING_SAMPLER: 'on' },
+        env: { TOOLING_SAMPLER: 'on' },
       })
-      const messages: Message[] = []
-      let collector: Server
+      const messages = () => readMessages(next.cliOutput)
 
       beforeAll(async () => {
-        collector = await startCollector(messages)
-        next.env.TOOLING_ENDPOINT = `http://127.0.0.1:${(collector.address() as { port: number }).port}`
         next.env.TOOLING_TRACE_FILE = join('otel-output', 'trace')
       })
-      afterAll(async () => {
-        await new Promise<void>((resolve) => collector?.close(() => resolve()))
-      })
 
-      it('flushes the failure root without loading stale instrumentation or losing registered exports', async () => {
+      it('reports the failure root without loading stale instrumentation or losing registered exports', async () => {
         if (phase === 'before') {
           await next.patchFile('next.config.ts', (source) =>
             source.replace(
@@ -581,8 +841,8 @@ describe('experimental tooling OTel', () => {
           // controlled error path here rather than promising crash-safe export.
           await next.patchFile('next.config.ts', (source) =>
             source.replace(
-              "distDir: 'otel-output'",
-              "distDir: 'otel-output', experimental: { prerenderEarlyExit: false }"
+              'devAndBuildOtel: true',
+              'devAndBuildOtel: true, prerenderEarlyExit: false'
             )
           )
           await next.patchFile(
@@ -603,21 +863,12 @@ describe('experimental tooling OTel', () => {
           existsSync(join(next.testDir, 'stale-instrumentation-ran'))
         ).toBe(false)
         if (phase === 'before') {
-          expect(messages).toEqual([])
+          expect(messages()).toEqual([])
         } else {
           expect(
-            messages.filter((message) => message.kind === 'register')
+            messages().filter((message) => message.kind === 'register')
           ).toHaveLength(1)
-          expect(
-            messages.filter((message) => message.kind === 'flush')
-          ).toEqual([
-            expect.objectContaining({
-              registrations: 1,
-              localHasRoot: true,
-              identityStable: true,
-            }),
-          ])
-          const exported = messages.flatMap((message) => message.spans ?? [])
+          const exported = messages().flatMap((message) => message.spans ?? [])
           expect(
             exported.find((span) => span.name === 'next-build')?.attributes
           ).toMatchObject({ failed: true })

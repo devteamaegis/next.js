@@ -721,7 +721,10 @@ class NextTracerImpl implements NextTracer {
           wallStartTimeMs: options.wallStartTimeMs,
         })
         const source = recorder.getToolingSpanSource(span)!
-        if (process.env.__NEXT_DEV_SERVER) {
+        if (
+          process.env.__NEXT_DEV_SERVER &&
+          type !== ToolingSpan.devServerSession
+        ) {
           const { captureToolingSpanRecorder } =
             require('./request-span-recorder') as typeof import('./request-span-recorder')
           source.recordSpans = captureToolingSpanRecorder(
@@ -731,23 +734,15 @@ class NextTracerImpl implements NextTracer {
             type
           )
         }
-        if (process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1') {
-          const { selectToolingSpanSource } =
-            require('../../../trace/trace') as typeof import('../../../trace/trace')
-          selectToolingSpanSource(source)
-          source.reporting = (
-            require('../../../trace/otel') as typeof import('../../../trace/otel')
-          ).startSpan({
-            name,
-            id: source.id,
-            parentId: source.parentId,
-            startTime: source.startTime,
-            reportingParent: source.reportingParent,
-            reportingRoot:
-              type === ToolingSpan.nextBuild ||
-              type === ToolingSpan.startDevServer,
-          })
-        }
+        const { startToolingSpanReporting } =
+          require('../../../trace/trace') as typeof import('../../../trace/trace')
+        startToolingSpanReporting(
+          source,
+          name,
+          type === ToolingSpan.nextBuild ||
+            type === ToolingSpan.devServerSession ||
+            (type === ToolingSpan.startDevServer && !parentSpan)
+        )
         return span
       } else {
         throw new Error('Tooling spans are not available in the Edge runtime')

@@ -1,15 +1,18 @@
-import { trace } from '@opentelemetry/api'
+import { metrics, trace } from '@opentelemetry/api'
+import {
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from '@opentelemetry/sdk-metrics'
 import {
   AlwaysOffSampler,
   AlwaysOnSampler,
-  BatchSpanProcessor,
+  SimpleSpanProcessor,
   TracerProvider,
 } from '@opentelemetry/sdk-trace'
 import type { SpanExporter } from '@opentelemetry/sdk-trace'
-import { readFileSync } from 'node:fs'
+import { writeSync } from 'node:fs'
 
 let registrations = 0
-let provider: TracerProvider
 let registeredProvider: ReturnType<typeof trace.getTracerProvider>
 // Observe live SDK parents without inventing an end for unfinished tooling work.
 const unfinished = new Map<
@@ -17,13 +20,17 @@ const unfinished = new Map<
   { name: string; spanId: string; traceId: string; toolingId: unknown }
 >()
 
-async function send(body: unknown) {
-  const response = await fetch(process.env.TOOLING_ENDPOINT!, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!response.ok) throw new Error('Test collector rejected traces')
+// A synchronous test exporter observes SDK delivery without relying on exit hooks.
+function send(body: Record<string, unknown>) {
+  writeSync(
+    1,
+    `[tooling-otel]${JSON.stringify({
+      ...body,
+      time: Date.now(),
+      identityStable: trace.getTracerProvider() === registeredProvider,
+      unfinished: [...unfinished.values()],
+    })}\n`
+  )
 }
 
 export async function register() {
@@ -31,7 +38,7 @@ export async function register() {
   registrations++
   const exporter: SpanExporter = {
     export(spans, callback) {
-      void send({
+      send({
         kind: 'spans',
         pid: process.pid,
         spans: spans.map((span) => ({
@@ -44,14 +51,12 @@ export async function register() {
           endTime: span.endTime,
           attributes: span.attributes,
         })),
-      }).then(
-        () => callback({ code: 0 }),
-        (error) => callback({ code: 1, error })
-      )
+      })
+      callback({ code: 0 })
     },
     async shutdown() {},
   }
-  provider = new TracerProvider({
+  const provider = new TracerProvider({
     sampler:
       process.env.TOOLING_SAMPLER === 'off'
         ? new AlwaysOffSampler()
@@ -73,45 +78,45 @@ export async function register() {
         async forceFlush() {},
         async shutdown() {},
       },
-      new BatchSpanProcessor({
-        exporter,
-        maxQueueSize: 20000,
-        maxExportBatchSize: 1000,
-      }),
+      new SimpleSpanProcessor({ exporter }),
     ],
   })
   const installed = trace.setGlobalTracerProvider(provider)
+  const meterProvider = new MeterProvider({
+    readers: [
+      new PeriodicExportingMetricReader({
+        exportIntervalMillis: 50,
+        exporter: {
+          export(resourceMetrics, callback) {
+            send({
+              kind: 'metrics',
+              pid: process.pid,
+              metrics: resourceMetrics.scopeMetrics.flatMap((scope) =>
+                scope.metrics.map((metric) => ({
+                  name: metric.descriptor.name,
+                  unit: metric.descriptor.unit,
+                  instrumentationScope: scope.scope.name,
+                  dataPoints: metric.dataPoints,
+                }))
+              ),
+            })
+            callback({ code: 0 })
+          },
+          async forceFlush() {},
+          async shutdown() {},
+        },
+      }),
+    ],
+  })
+  const metricsInstalled = metrics.setGlobalMeterProvider(meterProvider)
   registeredProvider = trace.getTracerProvider()
-  await send({
+  send({
     kind: 'register',
     pid: process.pid,
     phase: process.env.NEXT_PHASE,
     installed,
+    metricsInstalled,
     registrations,
     time: Date.now(),
-  })
-}
-
-export async function flushTraces() {
-  // This assertion is deliberately in the application hook: it proves ordering
-  // at the real process boundary, not just after the test has stopped Next.
-  const lines = readFileSync(process.env.TOOLING_TRACE_FILE!, 'utf8')
-    .trim()
-    .split('\n')
-  const events = lines.flatMap((line) => JSON.parse(line))
-  await provider.forceFlush()
-  await send({
-    kind: 'flush',
-    pid: process.pid,
-    registrations,
-    identityStable: trace.getTracerProvider() === registeredProvider,
-    unfinished: [...unfinished.values()],
-    localHasRoot: events.some(
-      (event) =>
-        event.name ===
-        (process.env.NEXT_PHASE === 'phase-production-build'
-          ? 'next-build'
-          : 'start-dev-server')
-    ),
   })
 }
